@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"github.com/kubeedge/kubeedge/cloud/pkg/devicecontroller/types"
 	"os"
+	"strconv"
 	"syscall"
+	"encoding/json"
 	"time"
 
 	"github.com/d2r2/go-dht"
 	"github.com/d2r2/go-shell"
+
+	"github.com/yosssi/gmq/mqtt"
+	"github.com/yosssi/gmq/mqtt/client"
 
 	logger "github.com/d2r2/go-logger"
 )
@@ -16,6 +23,55 @@ var lg = logger.NewPackageLogger("main",
 	logger.DebugLevel,
 	// logger.InfoLevel,
 )
+
+//DeviceStateUpdate is the structure used in updating the device state
+type DeviceStateUpdate struct {
+	State string `json:"state,omitempty"`
+}
+
+//BaseMessage the base struct of event message
+type BaseMessage struct {
+	EventID   string `json:"event_id"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+//TwinValue the struct of twin value
+type TwinValue struct {
+	Value    *string        `json:"value, omitempty"`
+	Metadata *ValueMetadata `json:"metadata,omitempty"`
+}
+
+//ValueMetadata the meta of value
+type ValueMetadata struct {
+	Timestamp int64 `json:"timestamp, omitempty"`
+}
+
+//TypeMetadata the meta of value type
+type TypeMetadata struct {
+	Type string `json:"type,omitempty"`
+}
+
+//TwinVersion twin version
+type TwinVersion struct {
+	CloudVersion int64 `json:"cloud"`
+	EdgeVersion  int64 `json:"edge"`
+}
+
+//MsgTwin the struct of device twin
+type MsgTwin struct {
+	Expected        *TwinValue    `json:"expected,omitempty"`
+	Actual          *TwinValue    `json:"actual,omitempty"`
+	Optional        *bool         `json:"optional,omitempty"`
+	Metadata        *TypeMetadata `json:"metadata,omitempty"`
+	ExpectedVersion *TwinVersion  `json:"expected_version,omitempty"`
+	ActualVersion   *TwinVersion  `json:"actual_version,omitempty"`
+}
+
+//DeviceTwinUpdate the struct of device twin update
+type DeviceTwinUpdate struct {
+	BaseMessage
+	Twin map[string]*MsgTwin `json:"twin"`
+}
 
 func main() {
 	defer logger.FinalizeLogger()
@@ -42,15 +98,34 @@ func main() {
 	// run goroutine waiting for OS termination events, including keyboard Ctrl+C
 	shell.CloseContextOnSignals(cancel, done, signals...)
 
-	// sensorType := dht.DHT11
+	sensorType := dht.DHT11
 	// sensorType := dht.AM2302
-	sensorType := dht.DHT12
-	pin := 1
+	//sensorType := dht.DHT12
+	pin := 11
 	totalRetried := 0
 	totalMeasured := 0
 	totalFailed := 0
 	term := false
-	for i := 0; i < 300; i++ {
+
+	cli := client.New(&client.Options{
+		// Define the processing of the error handler.
+		ErrorHandler: func(err error) {
+			fmt.Println(err)
+		},
+	})
+	defer cli.Terminate()
+
+	// Connect to the MQTT Server.
+	err := cli.Connect(&client.ConnectOptions{
+		Network:  "tcp",
+		Address:  "localhost:1883",
+		ClientID: []byte("receive-client"),
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	for {
 		// Read DHT11 sensor data from specific pin, retrying 10 times in case of failure.
 		temperature, humidity, retried, err :=
 			dht.ReadDHTxxWithContextAndRetry(ctx, sensorType, pin, false, 10)
@@ -66,6 +141,19 @@ func main() {
 			lg.Infof("Sensor = %v: Temperature = %v*C, Humidity = %v%% (retried %d times)",
 				sensorType, temperature, humidity, retried)
 		}
+
+		deviceTwinUpdate := "$hw/events/device/" + "temperature" + "/twin/update"
+
+		updateMessage:=createActualUpdateMessage(strconv.Itoa(int(temperature))+"*C")
+		twinUpdateBody, _ := json.Marshal(updateMessage)
+
+		err = cli.Publish(&client.PublishOptions{
+			TopicName:[]byte(deviceTwinUpdate),
+			QoS:mqtt.QoS0,
+			Message:twinUpdateBody,
+		})
+
+
 		select {
 		// Check for termination request.
 		case <-ctx.Done():
@@ -79,8 +167,13 @@ func main() {
 			break
 		}
 	}
-	lg.Info("====================================================================")
-	lg.Infof("Total measured = %v, total retried = %v, total failed = %v",
-		totalMeasured, totalRetried, totalFailed)
-	lg.Info("====================================================================")
+	lg.Info("exited")
+}
+
+//createActualUpdateMessage function is used to create the device twin update message
+func createActualUpdateMessage(actualValue string) DeviceTwinUpdate {
+	var deviceTwinUpdateMessage DeviceTwinUpdate
+	actualMap := map[string]*MsgTwin{"temperature-status": {Actual: &TwinValue{Value: &actualValue}, Metadata: &TypeMetadata{Type: "Updated"}}}
+	deviceTwinUpdateMessage.Twin = actualMap
+	return deviceTwinUpdateMessage
 }
